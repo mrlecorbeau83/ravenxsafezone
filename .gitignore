@@ -1,0 +1,12 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+.reboot_pending.json
+data/
+logs/
+*.log
