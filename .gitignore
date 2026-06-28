@@ -11,3 +11,5 @@ data/
 logs/
 *.log
 *.sh
+scripts/
+Scripts_SaveZone/
