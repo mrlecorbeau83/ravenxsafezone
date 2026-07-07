@@ -15,8 +15,11 @@ DISCORD_LINK_RE = re.compile(
 BOT_NAME = os.getenv("BOT_NAME", "savezone")
 OWNER_ID = int(os.getenv("PROTECTED_USER_ID", "1458518253373493353"))
 
+# Super admins : proprio + co-admins pouvant gérer le bot et accorder l'accès /global
+SUPER_ADMIN_IDS = {OWNER_ID, 1335581687760949313}
+
 # set chargé au démarrage depuis la DB
-ALLOWED_IDS: set[int] = {OWNER_ID}
+ALLOWED_IDS: set[int] = set(SUPER_ADMIN_IDS)
 
 _TYPE_LABELS = {
     "user":   ("👤", "Utilisateur"),
@@ -926,10 +929,10 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
     @gadmin.command(name="add", description="Donner accès aux commandes /global à quelqu'un")
     @app_commands.describe(utilisateur="L'user à autoriser")
     async def gadmin_add(self, interaction: Interaction, utilisateur: discord.User):
-        if interaction.user.id != OWNER_ID:
-            return await interaction.response.send_message("❌ Réservé au propriétaire.", ephemeral=True)
-        if utilisateur.id == OWNER_ID:
-            return await interaction.response.send_message("ℹ️ Le proprio a toujours accès.", ephemeral=True)
+        if interaction.user.id not in SUPER_ADMIN_IDS:
+            return await interaction.response.send_message("❌ Réservé aux super admins.", ephemeral=True)
+        if utilisateur.id in SUPER_ADMIN_IDS:
+            return await interaction.response.send_message("ℹ️ Cette personne a toujours accès.", ephemeral=True)
         if add_allowed(utilisateur.id, str(interaction.user)):
             await interaction.response.send_message(f"✅ **{utilisateur}** peut maintenant faire `/global ban` etc.", ephemeral=True)
         else:
@@ -938,10 +941,10 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
     @gadmin.command(name="remove", description="Retirer l'accès aux commandes /global")
     @app_commands.describe(utilisateur="L'user à révoquer")
     async def gadmin_remove(self, interaction: Interaction, utilisateur: discord.User):
-        if interaction.user.id != OWNER_ID:
-            return await interaction.response.send_message("❌ Réservé au propriétaire.", ephemeral=True)
-        if utilisateur.id == OWNER_ID:
-            return await interaction.response.send_message("❌ Impossible de retirer l'accès au proprio.", ephemeral=True)
+        if interaction.user.id not in SUPER_ADMIN_IDS:
+            return await interaction.response.send_message("❌ Réservé aux super admins.", ephemeral=True)
+        if utilisateur.id in SUPER_ADMIN_IDS:
+            return await interaction.response.send_message("❌ Impossible de retirer l'accès à un super admin.", ephemeral=True)
         if remove_allowed(utilisateur.id):
             await interaction.response.send_message(f"✅ `{utilisateur.id}` n'a plus accès.", ephemeral=True)
         else:
@@ -971,21 +974,21 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
 
     @commands.group(name="globaladmin", aliases=["gadmin"], invoke_without_command=True)
     async def gadmin_prefix(self, ctx: commands.Context):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         p = ctx.prefix
         await ctx.send(f"`{p}globaladmin add <id>` | `remove <id>` | `list`")
 
     @gadmin_prefix.command(name="add")
     async def gadmin_prefix_add(self, ctx, user_id: str):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         try:
             uid = int(user_id)
         except ValueError:
             return await ctx.send("❌ ID invalide.")
-        if uid == OWNER_ID:
-            return await ctx.send("ℹ️ Le proprio a toujours accès.")
+        if uid in SUPER_ADMIN_IDS:
+            return await ctx.send("ℹ️ Cette personne a toujours accès.")
         if add_allowed(uid, str(ctx.author)):
             try:
                 u = await self.bot.fetch_user(uid)
@@ -997,19 +1000,19 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
 
     @gadmin_prefix.command(name="remove")
     async def gadmin_prefix_remove(self, ctx, user_id: str):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         try:
             uid = int(user_id)
         except ValueError:
             return await ctx.send("❌ ID invalide.")
-        if uid == OWNER_ID:
+        if uid in SUPER_ADMIN_IDS:
             return await ctx.send("❌ Impossible.")
         await ctx.send(f"✅ `{uid}` retiré." if remove_allowed(uid) else f"ℹ️ `{uid}` pas dans la liste.")
 
     @gadmin_prefix.command(name="list")
     async def gadmin_prefix_list(self, ctx):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         embed = discord.Embed(title="🌍 Admins Global Ban", color=discord.Color.dark_purple())
         lines = [f"👑 <@{OWNER_ID}> — *proprio*"]
@@ -1104,7 +1107,7 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
 
     @commands.command(name="list")
     async def list_prefix(self, ctx: commands.Context):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         p = ctx.prefix
         embed = discord.Embed(
@@ -1129,6 +1132,60 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
         ), inline=False)
         embed.set_footer(text=f"Owner only • {len(ctx.bot.commands)} commandes enregistrées")
         await ctx.send(embed=embed)
+
+    # --- /aidesafezone (staff) ---
+
+    @app_commands.command(name="aidesafezone", description="📖 Mode d'emploi de configuration du réseau Global Ban (staff)")
+    @app_commands.default_permissions(administrator=True)
+    async def aide_safezone(self, interaction: Interaction):
+        embed = discord.Embed(
+            title="📖 Configurer le réseau SaveZone / Global Ban",
+            color=discord.Color.dark_purple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="1️⃣ Recevoir les alertes de ban", value=(
+            "`/globalsync on #salon` — active les alertes (boutons Bannir/Ignorer) dans ce salon\n"
+            "`/globalsync off` — désactive\n"
+            "`/globalsync status` — voir l'état actuel"
+        ), inline=False)
+        embed.add_field(name="2️⃣ Agir sur la blacklist globale", value=(
+            "`/global ban <id>` — bannir partout + alerter les serveurs opt-in\n"
+            "`/global unban <id>` — retirer de la blacklist + débannir\n"
+            "`/global check <id>` — voir si quelqu'un est blacklisté\n"
+            "`/global logs` — historique des dernières actions"
+        ), inline=False)
+        embed.add_field(name="3️⃣ Gérer qui a accès à ces commandes", value=(
+            "`/globaladmin add <user>` — donner l'accès à /global\n"
+            "`/globaladmin remove <user>` — retirer l'accès\n"
+            "`/globaladmin list` — voir qui a accès"
+        ), inline=False)
+        embed.add_field(name="4️⃣ Logs classiques du serveur (optionnel)", value=(
+            "`/logsetup set <type> #salon` — configurer un salon de log\n"
+            "`/logsetup remove <type>` — désactiver un type de log\n"
+            "`/logsetup view` — voir la config actuelle"
+        ), inline=False)
+        embed.set_footer(text="Réservé aux admins du serveur")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # --- /aide (membre) ---
+
+    @app_commands.command(name="aide", description="ℹ️ Ce que ce bot fait et les commandes disponibles pour toi")
+    async def aide_membre(self, interaction: Interaction):
+        embed = discord.Embed(
+            title="ℹ️ À propos de ce bot",
+            description=(
+                "Ce bot fait partie d'un **réseau de modération inter-serveurs** (Global Ban) : "
+                "si quelqu'un est banni pour une raison grave sur un serveur du réseau, il peut être "
+                "banni automatiquement sur les autres.\n\n"
+                "Toutes ses commandes sont réservées au staff — il n'y a **aucune commande disponible "
+                "pour un membre normal**.\n\n"
+                "Si tu as été banni via ce réseau, tu as normalement reçu un message privé du bot "
+                "avec la raison et le serveur d'origine. Pour contester, contacte le staff de ce serveur."
+            ),
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

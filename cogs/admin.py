@@ -7,6 +7,8 @@ import json
 import time
 
 OWNER_ID = int(os.getenv("PROTECTED_USER_ID", "1458518253373493353"))
+# Super admins : proprio + co-admins pouvant gérer le bot (mêmes IDs que global_mod.py)
+SUPER_ADMIN_IDS = {OWNER_ID, 1335581687760949313}
 REBOOT_FILE = ".reboot_pending.json"
 
 
@@ -52,7 +54,7 @@ class AdminCog(commands.Cog, name="Admin"):
     # sync les slash commands
     @commands.command(name="sync")
     async def sync_cmd(self, ctx, guild_id: str = None):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         if guild_id:
             try:
@@ -68,7 +70,7 @@ class AdminCog(commands.Cog, name="Admin"):
 
     @commands.command(name="reload")
     async def reload_cmd(self, ctx, cog: str = None):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         if cog == "all" or cog is None:
             reloaded = []
@@ -93,14 +95,14 @@ class AdminCog(commands.Cog, name="Admin"):
 
     @commands.command(name="cogs")
     async def list_cogs(self, ctx):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         lines = [f"• `{ext}`" for ext in self.bot.extensions.keys()]
         await ctx.send("**Cogs chargés :**\n" + "\n".join(lines))
 
     @commands.command(name="bots")
     async def bots_info(self, ctx):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
         bot_name = os.getenv("BOT_NAME", "savezone")
         guilds = len(self.bot.guilds)
@@ -118,7 +120,7 @@ class AdminCog(commands.Cog, name="Admin"):
 
     @commands.command(name="reboot")
     async def reboot_cmd(self, ctx):
-        if ctx.author.id != OWNER_ID:
+        if ctx.author.id not in SUPER_ADMIN_IDS:
             return
 
         embed = discord.Embed(
@@ -134,7 +136,7 @@ class AdminCog(commands.Cog, name="Admin"):
         btn_cancel  = discord.ui.Button(label="❌ Annuler",   style=discord.ButtonStyle.secondary)
 
         async def on_confirm(interaction: discord.Interaction):
-            if interaction.user.id != OWNER_ID:
+            if interaction.user.id not in SUPER_ADMIN_IDS:
                 return await interaction.response.send_message("❌ Pas pour toi.", ephemeral=True)
             view.stop()
             with open(REBOOT_FILE, "w") as f:
@@ -154,7 +156,7 @@ class AdminCog(commands.Cog, name="Admin"):
             await self.bot.close()
 
         async def on_cancel(interaction: discord.Interaction):
-            if interaction.user.id != OWNER_ID:
+            if interaction.user.id not in SUPER_ADMIN_IDS:
                 return await interaction.response.send_message("❌ Pas pour toi.", ephemeral=True)
             view.stop()
             await interaction.response.edit_message(
