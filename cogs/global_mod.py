@@ -12,21 +12,22 @@ DISCORD_LINK_RE = re.compile(
     r'^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/\d+/\d+/\d+$'
 )
 
-BOT_NAME = os.getenv("BOT_NAME", "savezone")
-OWNER_ID = int(os.getenv("PROTECTED_USER_ID", "1458518253373493353"))
+BOT_NAME = os.getenv("BOT_NAME", "safezone")
 
-# Super admins : proprio + co-admins pouvant gérer le bot et accorder l'accès /global
-SUPER_ADMIN_IDS = {OWNER_ID, 1335581687760949313}
-
-# set chargé au démarrage depuis la DB
-ALLOWED_IDS: set[int] = set(SUPER_ADMIN_IDS)
-
-_TYPE_LABELS = {
-    "user":   ("👤", "Utilisateur"),
-    "word":   ("🔤", "Mot"),
-    "domain": ("🌐", "Domaine"),
-    "guild":  ("🏠", "Serveur"),
+# admins fixes, gèrent /globaladmin et /global watch/unwatch
+ADMIN_IDS = {
+    1335581687760949313,
 }
+
+# accès à /global ban/unban/check/logs, extensible via /globaladmin
+ALLOWED_IDS: set[int] = set(ADMIN_IDS)
+
+
+async def _require(interaction: Interaction, allowed: set[int]) -> bool:
+    if interaction.user.id in allowed:
+        return True
+    await interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
+    return False
 
 
 # --- DB ---
@@ -35,6 +36,9 @@ def _db_path():
     path = os.getenv("SHARED_GLOBAL_DB_PATH", "data/database/global/global_lists.db")
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     return path
+
+
+_schema_migrated = False
 
 
 def get_db():
@@ -52,14 +56,6 @@ def get_db():
         source_guild_name TEXT DEFAULT '',
         UNIQUE(type, value))""")
 
-    # migration si colonnes pas encore là
-    for col in ("source_guild_id TEXT DEFAULT ''", "source_guild_name TEXT DEFAULT ''"):
-        try:
-            conn.execute(f"ALTER TABLE global_blacklist ADD COLUMN {col}")
-            conn.commit()
-        except Exception:
-            pass
-
     conn.execute("CREATE INDEX IF NOT EXISTS idx_bl_type ON global_blacklist(type)")
 
     conn.execute("""CREATE TABLE IF NOT EXISTS guild_ban_sync (
@@ -67,22 +63,13 @@ def get_db():
         enabled INTEGER DEFAULT 0,
         enabled_at TEXT,
         notification_channel_id TEXT)""")
-    try:
-        conn.execute("ALTER TABLE guild_ban_sync ADD COLUMN notification_channel_id TEXT")
-        conn.commit()
-    except Exception:
-        pass
-
-    conn.execute("""CREATE TABLE IF NOT EXISTS pending_ban_sync (
-        guild_id TEXT PRIMARY KEY,
-        queued_at TEXT NOT NULL)""")
 
     conn.execute("""CREATE TABLE IF NOT EXISTS global_cmd_allowed (
         user_id TEXT PRIMARY KEY,
         added_by TEXT NOT NULL,
         added_at TEXT NOT NULL)""")
 
-    # table inter-bots — Raven et SaveZone écrivent ici pour se notifier
+    # table inter-bots — Raven et SafeZone écrivent ici pour se notifier
     conn.execute("""CREATE TABLE IF NOT EXISTS cross_bot_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         source_bot TEXT NOT NULL,
@@ -97,12 +84,23 @@ def get_db():
         created_at TEXT NOT NULL,
         processed_by TEXT DEFAULT '')""")
 
-    for col in ("source_guild_id TEXT DEFAULT ''", "source_guild_name TEXT DEFAULT ''"):
-        try:
-            conn.execute(f"ALTER TABLE cross_bot_events ADD COLUMN {col}")
-            conn.commit()
-        except Exception:
-            pass
+    # Salons (forums de report externes) surveillés pour la détection auto de Global Ban
+    # (tables partagées avec Raven — même fichier DB, même schéma)
+    conn.execute("""CREATE TABLE IF NOT EXISTS global_watch_channels (
+        channel_id TEXT PRIMARY KEY,
+        guild_id   TEXT NOT NULL,
+        added_by   TEXT NOT NULL,
+        added_at   TEXT NOT NULL)""")
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS global_pending_reports (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_id     TEXT NOT NULL,
+        reason        TEXT DEFAULT '',
+        message_link  TEXT DEFAULT '',
+        source_guild_id   TEXT DEFAULT '',
+        source_guild_name TEXT DEFAULT '',
+        status        TEXT DEFAULT 'pending',
+        created_at    TEXT NOT NULL)""")
 
     conn.execute("""CREATE TABLE IF NOT EXISTS admin_audit_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +113,23 @@ def get_db():
         proof_link TEXT DEFAULT '',
         guild_name TEXT DEFAULT '',
         created_at TEXT NOT NULL)""")
+
+    global _schema_migrated
+    if not _schema_migrated:
+        # rattrape les colonnes ajoutées après coup, au cas où la DB partagée avec Raven
+        # ne les aurait pas encore (une seule fois par process, pas à chaque get_db())
+        for table, col in (
+            ("global_blacklist", "source_guild_id TEXT DEFAULT ''"),
+            ("global_blacklist", "source_guild_name TEXT DEFAULT ''"),
+            ("guild_ban_sync", "notification_channel_id TEXT"),
+            ("cross_bot_events", "source_guild_id TEXT DEFAULT ''"),
+            ("cross_bot_events", "source_guild_name TEXT DEFAULT ''"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+            except Exception:
+                pass
+        _schema_migrated = True
 
     conn.commit()
     return conn
@@ -203,19 +218,6 @@ def list_allowed() -> list:
         return []
 
 
-# --- helpers blacklist ---
-
-def is_blacklisted(type_: str, value: str) -> bool:
-    try:
-        conn = get_db()
-        r = conn.execute("SELECT 1 FROM global_blacklist WHERE type=? AND value=?",
-                         (type_, str(value).lower())).fetchone()
-        conn.close()
-        return r is not None
-    except Exception:
-        return False
-
-
 def get_optin_guilds() -> set:
     try:
         conn = get_db()
@@ -238,6 +240,95 @@ def get_notif_channel(guild_id: int) -> int | None:
     except Exception:
         pass
     return None
+
+
+# Serveur de review où sont postées les propositions détectées automatiquement
+REVIEW_GUILD_ID = 1319470415705276486
+
+
+def get_watch_channel_ids() -> set[int]:
+    try:
+        conn = get_db()
+        rows = conn.execute("SELECT channel_id FROM global_watch_channels").fetchall()
+        conn.close()
+        return {int(r[0]) for r in rows}
+    except Exception:
+        return set()
+
+
+def add_watch_channel(channel_id: int, guild_id: int, added_by: str) -> bool:
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT OR IGNORE INTO global_watch_channels (channel_id, guild_id, added_by, added_at) VALUES (?, ?, ?, ?)",
+            (str(channel_id), str(guild_id), added_by, datetime.now(timezone.utc).isoformat())
+        )
+        conn.commit()
+        changed = conn.execute("SELECT changes()").fetchone()[0]
+        conn.close()
+        return bool(changed)
+    except Exception:
+        return False
+
+
+def remove_watch_channel(channel_id: int) -> bool:
+    try:
+        conn = get_db()
+        conn.execute("DELETE FROM global_watch_channels WHERE channel_id = ?", (str(channel_id),))
+        conn.commit()
+        changed = conn.execute("SELECT changes()").fetchone()[0]
+        conn.close()
+        return bool(changed)
+    except Exception:
+        return False
+
+
+def save_pending_report(target_id: int, reason: str, message_link: str,
+                         source_guild_id: int, source_guild_name: str) -> int | None:
+    """Enregistre une proposition détectée auto. Retourne None si ce post a déjà été traité
+    (évite les doublons si Raven et SafeZone surveillent le même salon)."""
+    try:
+        conn = get_db()
+        existing = conn.execute(
+            "SELECT id FROM global_pending_reports WHERE message_link = ?", (message_link,)
+        ).fetchone()
+        if existing:
+            conn.close()
+            return None
+        cur = conn.execute(
+            """INSERT INTO global_pending_reports
+               (target_id, reason, message_link, source_guild_id, source_guild_name, status, created_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+            (str(target_id), reason, message_link, str(source_guild_id), source_guild_name,
+             datetime.now(timezone.utc).isoformat())
+        )
+        conn.commit()
+        pending_id = cur.lastrowid
+        conn.close()
+        return pending_id
+    except Exception as e:
+        print(f"[GlobalBanWatch SZ] Erreur enregistrement pending report: {e}")
+        return None
+
+
+def get_pending_report(pending_id: int) -> dict | None:
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT * FROM global_pending_reports WHERE id = ?", (pending_id,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def set_pending_report_status(pending_id: int, status: str):
+    try:
+        conn = get_db()
+        conn.execute("UPDATE global_pending_reports SET status = ? WHERE id = ?", (status, pending_id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 # --- cross-bot ---
@@ -263,6 +354,8 @@ def write_event(event_type: str, target_id: int, reason="", banner_name="",
 
 # --- boutons persistants ---
 
+# admin du serveur local (pas ALLOWED_IDS) : chaque serveur opt-in gère lui-même qui peut
+# cliquer sur ses propres alertes, indépendamment de qui a accès aux commandes /global
 async def _check_admin(interaction: discord.Interaction) -> bool:
     if not interaction.guild:
         return False
@@ -346,7 +439,7 @@ class AlertView(discord.ui.View):
 
 
 async def send_alerts(bot, target_id: int, reason: str, banner: str,
-                      link=None, guild_name="", source_bot=BOT_NAME):
+                      link=None, guild_name=""):
     optin = get_optin_guilds()
     try:
         u = await bot.fetch_user(target_id)
@@ -355,8 +448,6 @@ async def send_alerts(bot, target_id: int, reason: str, banner: str,
     except Exception:
         target_str = f"`{target_id}`"
         avatar = None
-
-    origin = "Raven" if source_bot == "raven" else "SaveZone"
 
     embed = discord.Embed(
         title="⚠️ Alerte — Global Ban Réseau",
@@ -368,12 +459,12 @@ async def send_alerts(bot, target_id: int, reason: str, banner: str,
     embed.add_field(name="Banni par", value=banner, inline=True)
     embed.add_field(name="Raison", value=reason, inline=False)
     if guild_name:
-        embed.add_field(name="Serveur d'origine", value=f"**{guild_name}** (via {origin})", inline=False)
+        embed.add_field(name="Serveur d'origine", value=f"**{guild_name}** (via SafeZone)", inline=False)
     if link:
         embed.add_field(name="Preuve", value=f"[Voir le message]({link})", inline=False)
     if avatar:
         embed.set_thumbnail(url=avatar)
-    embed.set_footer(text="SaveZone • admin requis pour agir")
+    embed.set_footer(text="SafeZone • admin requis pour agir")
 
     view = AlertView(tid=target_id)
     for g in bot.guilds:
@@ -392,6 +483,129 @@ async def send_alerts(bot, target_id: int, reason: str, banner: str,
         await asyncio.sleep(0.3)
 
 
+def _finalize_global_ban(bot, target_id: int, raison: str, executor, message_link: str,
+                          source_guild_id: int, source_guild_name: str) -> bool:
+    """Insère dans la blacklist globale. Si nouveau : audit, event cross-bot, DM à la cible,
+    alerte réseau. Renvoie False sans rien notifier si déjà présent (évite les doublons)."""
+    conn = get_db()
+    conn.execute(
+        """INSERT OR IGNORE INTO global_blacklist
+           (type, value, reason, added_at, source_guild_id, source_guild_name)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("user", str(target_id), raison, datetime.now(timezone.utc).isoformat(),
+         str(source_guild_id), source_guild_name)
+    )
+    conn.commit()
+    changed = conn.execute("SELECT changes()").fetchone()[0]
+    conn.close()
+    if not changed:
+        return False
+
+    write_event("global_ban", target_id, raison, str(executor), executor.id,
+                message_link or "", source_guild_id, source_guild_name)
+    _write_audit("global_ban", target_id, str(target_id), executor.id, str(executor),
+                 raison, message_link or "", source_guild_name)
+
+    dm = discord.Embed(
+        title="⛔ Tu as été signalé sur le réseau SafeZone",
+        color=discord.Color.dark_red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    dm.add_field(name="Raison", value=raison or "—", inline=False)
+    dm.add_field(name="Serveur d'origine", value=source_guild_name or "—", inline=True)
+    if message_link:
+        dm.add_field(name="Preuve", value=f"[Voir le message]({message_link})", inline=False)
+    dm.set_footer(text="Si tu penses qu'il s'agit d'une erreur, contacte les administrateurs du réseau.")
+    asyncio.create_task(_send_dm(bot, target_id, dm))
+
+    asyncio.create_task(send_alerts(bot, target_id, raison, str(executor), message_link, source_guild_name))
+    return True
+
+
+async def execute_pending_report(bot, pending_id: int, executor) -> tuple[bool, object]:
+    """Transforme une proposition en attente en Global Ban réel (blacklist + alertes réseau)."""
+    report = get_pending_report(pending_id)
+    if not report:
+        return False, "Proposition introuvable (déjà traitée ?)."
+
+    target_id = int(report["target_id"])
+    raison = report["reason"] or "Ban Global Automatique (détecté via forum de report)"
+
+    _finalize_global_ban(bot, target_id, raison, executor, report["message_link"],
+                         int(report["source_guild_id"] or 0), report["source_guild_name"])
+    set_pending_report_status(pending_id, "confirmed")
+    return True, target_id
+
+
+class ReportConfirmDynamic(discord.ui.DynamicItem[discord.ui.Button], template=r'szreport_confirm:(?P<pending_id>[0-9]+)'):
+
+    def __init__(self, pending_id: int):
+        super().__init__(discord.ui.Button(
+            label="✅ Confirmer le Global Ban",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"szreport_confirm:{pending_id}",
+        ))
+        self.pending_id = pending_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(pending_id=int(match["pending_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await _require(interaction, ALLOWED_IDS):
+            return
+
+        message = interaction.message
+        original = message.embeds[0].copy() if message.embeds else discord.Embed(title="⚠️ Proposition Global Ban")
+        pending = original.copy()
+        pending.color = discord.Color.orange()
+        pending.add_field(name="⏳ Validation en cours...", value=interaction.user.mention, inline=False)
+        await interaction.response.edit_message(embed=pending, view=None)
+
+        ok, result = await execute_pending_report(interaction.client, self.pending_id, interaction.user)
+
+        final = original.copy()
+        if ok:
+            final.color = discord.Color.dark_red()
+            final.add_field(name="✅ Global Ban confirmé", value=f"Validé par {interaction.user.mention} — `{result}` ajouté à la blacklist globale.", inline=False)
+        else:
+            final.color = discord.Color.orange()
+            final.add_field(name="❌ Échec", value=str(result), inline=False)
+        await message.edit(embed=final, view=None)
+
+
+class ReportRejectDynamic(discord.ui.DynamicItem[discord.ui.Button], template=r'szreport_reject:(?P<pending_id>[0-9]+)'):
+
+    def __init__(self, pending_id: int):
+        super().__init__(discord.ui.Button(
+            label="🗑️ Ignorer",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"szreport_reject:{pending_id}",
+        ))
+        self.pending_id = pending_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(pending_id=int(match["pending_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await _require(interaction, ALLOWED_IDS):
+            return
+        set_pending_report_status(self.pending_id, "rejected")
+        embed = interaction.message.embeds[0].copy() if interaction.message.embeds else discord.Embed(title="⚠️ Proposition Global Ban")
+        embed.color = discord.Color.greyple()
+        embed.add_field(name="⏭️ Ignoré", value=interaction.user.mention, inline=False)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class ReportView(discord.ui.View):
+    """Vue persistante pour les propositions de Global Ban auto-détectées."""
+    def __init__(self, pending_id: int):
+        super().__init__(timeout=None)
+        self.add_item(ReportConfirmDynamic(pending_id))
+        self.add_item(ReportRejectDynamic(pending_id))
+
+
 # --- cog ---
 
 class GlobalModCog(commands.Cog, name="GlobalMod"):
@@ -400,12 +614,94 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
 
     async def cog_load(self):
         load_allowed()
-        self.bot.add_dynamic_items(BanButton, IgnoreButton)
+        self.bot.add_dynamic_items(BanButton, IgnoreButton, ReportConfirmDynamic, ReportRejectDynamic)
         self.crossbot_task.start()
-        print(f"[SaveZone] GlobalModCog ok (bot={BOT_NAME})")
+        print(f"[SafeZone] GlobalModCog ok (bot={BOT_NAME})")
 
     def cog_unload(self):
         self.crossbot_task.cancel()
+
+    # --- Détection auto Global Ban (forum de report surveillé) ---
+
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread: discord.Thread):
+        watch_ids = get_watch_channel_ids()
+        if thread.parent_id not in watch_ids:
+            return
+
+        match = re.search(r"[\s-](\d{15,20})\s*$", thread.name)
+        if not match:
+            print(f"[GlobalBanWatch SZ] Post « {thread.name} » ignoré : pas d'ID détecté dans le titre.")
+            return
+        target_id = int(match.group(1))
+
+        tags = [t.name for t in getattr(thread, "applied_tags", [])]
+
+        try:
+            starter = await thread.fetch_message(thread.id)
+        except Exception:
+            starter = None
+
+        excerpt = starter.content[:500] if starter and starter.content else ""
+        proof_url = starter.attachments[0].url if starter and starter.attachments else None
+
+        reason = f"Signalé via forum de report « {thread.name} »"
+        if tags:
+            reason += " — Tags: " + ", ".join(tags)
+
+        message_link = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{thread.id}"
+
+        pending_id = save_pending_report(
+            target_id=target_id,
+            reason=reason,
+            message_link=message_link,
+            source_guild_id=thread.guild.id,
+            source_guild_name=thread.guild.name,
+        )
+        if pending_id is None:
+            return
+
+        review_guild = self.bot.get_guild(REVIEW_GUILD_ID)
+        if not review_guild:
+            return
+        # les propositions atterrissent dans le salon /globalsync du serveur de review,
+        # pas un salon dédié séparé
+        ch_id = get_notif_channel(REVIEW_GUILD_ID)
+        log_ch = review_guild.get_channel(ch_id) if ch_id else None
+        if not log_ch:
+            return
+
+        try:
+            target_user = self.bot.get_user(target_id) or await self.bot.fetch_user(target_id)
+            target_display = f"{target_user} (`{target_id}`)"
+            target_avatar = target_user.display_avatar.url
+        except Exception:
+            target_display = f"ID `{target_id}`"
+            target_avatar = None
+
+        embed = discord.Embed(
+            title="🔎 Proposition de Global Ban — détection automatique",
+            description=f"Nouveau report détecté sur **{thread.guild.name}**. Vérifie la preuve avant de confirmer.",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="👤 Utilisateur ciblé", value=target_display, inline=True)
+        embed.add_field(name="📂 Salon source", value=thread.parent.mention if thread.parent else "?", inline=True)
+        if tags:
+            embed.add_field(name="🏷️ Tags", value=", ".join(tags), inline=False)
+        if excerpt:
+            embed.add_field(name="📝 Extrait du report", value=excerpt, inline=False)
+        embed.add_field(name="🔗 Lien du report", value=f"[Voir le post]({message_link})", inline=False)
+        if target_avatar:
+            embed.set_thumbnail(url=target_avatar)
+        if proof_url:
+            embed.set_image(url=proof_url)
+        embed.set_footer(text=f"Proposition #{pending_id} • accès /global requis pour valider")
+
+        try:
+            await log_ch.send(embed=embed, view=ReportView(pending_id=pending_id))
+        except Exception as e:
+            print(f"[GlobalBanWatch SZ] Échec envoi proposition #{pending_id}: {e}")
 
     # lit les events de Raven toutes les 15s
 
@@ -437,8 +733,6 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
         etype = ev["event_type"]
         tid = int(ev["target_id"])
         reason = ev.get("reason", "")
-        banner = ev.get("banner_name", "Bot distant")
-        link = ev.get("message_link") or None
         guild_name = ev.get("source_guild_name", "")
         src = ev.get("source_bot", "raven")
 
@@ -454,7 +748,7 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
                 )
                 conn.commit()
                 conn.close()
-                asyncio.create_task(send_alerts(self.bot, tid, reason, banner, link, guild_name, src))
+                # pas d'alerte relayée : seul SafeZone diffuse ses propres bans
                 print(f"[CrossBot SZ] ban reçu de {src}: {tid} ({guild_name})")
 
             elif etype == "global_unban":
@@ -481,20 +775,21 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
     global_group = app_commands.Group(
         name="global",
         description="Commandes global ban/unban/check",
-        default_permissions=discord.Permissions(administrator=True)
     )
 
     @global_group.command(name="ban", description="Global ban un user + alerte tous les serveurs opt-in")
     @app_commands.describe(
         user_id="ID de l'user à bannir",
-        raison="Raison",
-        message_link="Lien de preuve Discord (optionnel)"
+        raison="Raison (obligatoire)",
+        message_link="Lien de preuve Discord (obligatoire)"
     )
     async def global_ban(self, interaction: Interaction, user_id: str,
-                         raison: str = "Ban Global SaveZone", message_link: str = None):
-        if interaction.user.id not in ALLOWED_IDS:
-            return await interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
-        if message_link and not DISCORD_LINK_RE.match(message_link):
+                         raison: str, message_link: str):
+        if not await _require(interaction, ALLOWED_IDS):
+            return
+        if not raison.strip():
+            return await interaction.response.send_message("❌ La raison est obligatoire.", ephemeral=True)
+        if not DISCORD_LINK_RE.match(message_link):
             return await interaction.response.send_message("❌ Lien invalide. Format attendu : `https://discord.com/channels/GUILD/CHANNEL/MESSAGE`", ephemeral=True)
 
         try:
@@ -504,7 +799,6 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
         if tid == interaction.user.id:
             return await interaction.response.send_message("❌ Tu ne peux pas te bannir toi-même.", ephemeral=True)
 
-        # récupérer infos user
         try:
             target = await self.bot.fetch_user(tid)
             target_str = f"{target} (`{tid}`)"
@@ -515,7 +809,6 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
 
         gname = interaction.guild.name if interaction.guild else "DM"
 
-        # embed de confirmation
         embed = discord.Embed(
             title="⚠️ Confirmation — Global Ban",
             description="Tu es sur le point d'ajouter cet utilisateur à la blacklist globale.",
@@ -547,48 +840,25 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
                 optin = get_optin_guilds()
                 notified = sum(1 for g in self.bot.guilds if str(g.id) in optin)
 
-                conn = get_db()
-                conn.execute(
-                    """INSERT OR IGNORE INTO global_blacklist
-                       (type, value, reason, added_at, source_guild_id, source_guild_name)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    ("user", str(tid), raison, datetime.now(timezone.utc).isoformat(), str(gid), gname)
-                )
-                conn.commit()
-                conn.close()
+                changed = _finalize_global_ban(self.bot, tid, raison, interaction.user,
+                                               message_link, gid, gname)
 
-                write_event("global_ban", tid, raison, str(interaction.user),
-                            interaction.user.id, message_link or "", gid, gname)
-                _write_audit("global_ban", tid, target_str, interaction.user.id,
-                             str(interaction.user), raison, message_link or "", gname)
-
-                # DM à l'utilisateur banni
-                dm = discord.Embed(
-                    title="⛔ Tu as été signalé sur le réseau SaveZone",
-                    color=discord.Color.dark_red(),
-                    timestamp=datetime.now(timezone.utc)
-                )
-                dm.add_field(name="Raison", value=raison or "—", inline=False)
-                dm.add_field(name="Serveur d'origine", value=gname, inline=True)
-                if message_link:
-                    dm.add_field(name="Preuve", value=f"[Voir le message]({message_link})", inline=False)
-                dm.set_footer(text="Si tu penses qu'il s'agit d'une erreur, contacte les administrateurs du réseau.")
-                asyncio.create_task(_send_dm(self.bot, tid, dm))
-
-                done = discord.Embed(title="🌍 Global Ban — OK", color=discord.Color.dark_red(),
-                                     timestamp=datetime.now(timezone.utc))
+                if changed:
+                    done = discord.Embed(title="🌍 Global Ban — OK", color=discord.Color.dark_red(),
+                                         timestamp=datetime.now(timezone.utc))
+                    done.add_field(name="Serveurs éligibles (SZ)", value=str(notified), inline=True)
+                    done.add_field(name="Raven notifié", value="✅ via DB (15s)", inline=False)
+                else:
+                    done = discord.Embed(title="ℹ️ Déjà dans la blacklist globale", color=discord.Color.greyple(),
+                                         timestamp=datetime.now(timezone.utc))
                 done.add_field(name="Utilisateur", value=target_str, inline=True)
                 done.add_field(name="Raison", value=raison, inline=False)
                 done.add_field(name="Serveur d'origine", value=gname, inline=True)
-                done.add_field(name="Serveurs notifiés (SZ)", value=str(notified), inline=True)
-                done.add_field(name="Raven notifié", value="✅ via DB (15s)", inline=False)
                 if message_link:
                     done.add_field(name="Preuve", value=f"[Voir]({message_link})", inline=False)
                 done.set_footer(text=f"par {interaction.user}")
 
                 await btn_interaction.response.edit_message(embed=done, view=None)
-                asyncio.create_task(send_alerts(self.bot, tid, raison, str(interaction.user),
-                                                message_link, gname, BOT_NAME))
 
             @discord.ui.button(label="❌ Annuler", style=discord.ButtonStyle.secondary)
             async def cancel(self_v, btn_interaction: discord.Interaction, button: discord.ui.Button):
@@ -603,9 +873,9 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
     @global_group.command(name="unban", description="Retire de la blacklist globale + débannit des serveurs opt-in")
     @app_commands.describe(user_id="ID de l'user", raison="Raison")
     async def global_unban(self, interaction: Interaction, user_id: str,
-                           raison: str = "Unban Global SaveZone"):
-        if interaction.user.id not in ALLOWED_IDS:
-            return await interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
+                           raison: str = "Unban Global SafeZone"):
+        if not await _require(interaction, ALLOWED_IDS):
+            return
         await interaction.response.defer(ephemeral=True)
         try:
             tid = int(user_id)
@@ -645,9 +915,8 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
         _write_audit("global_unban", tid, target_name, interaction.user.id,
                      str(interaction.user), raison, "", gname)
 
-        # DM à l'utilisateur débanni
         dm = discord.Embed(
-            title="✅ Tu as été retiré de la liste noire du réseau SaveZone",
+            title="✅ Tu as été retiré de la liste noire du réseau SafeZone",
             color=discord.Color.green(),
             timestamp=datetime.now(timezone.utc)
         )
@@ -667,15 +936,8 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
     @global_group.command(name="check", description="Voir si un user est dans la blacklist globale")
     @app_commands.describe(user_id="ID de l'user")
     async def global_check(self, interaction: Interaction, user_id: str):
-        is_admin = False
-        if interaction.user.id in ALLOWED_IDS:
-            is_admin = True
-        elif interaction.guild:
-            m = interaction.guild.get_member(interaction.user.id)
-            if m and m.guild_permissions.administrator:
-                is_admin = True
-        if not is_admin:
-            return await interaction.response.send_message("❌ Réservé aux administrateurs.", ephemeral=True)
+        if not await _require(interaction, ALLOWED_IDS):
+            return
         try:
             tid = int(user_id)
         except ValueError:
@@ -708,184 +970,10 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # --- /global blacklist ---
-
-    bl_group = app_commands.Group(
-        name="blacklist",
-        description="Gérer la blacklist globale",
-        parent=global_group
-    )
-
-    _TYPES = ("user", "word", "domain", "guild")
-
-    @bl_group.command(name="add", description="Ajouter un utilisateur à la blacklist globale")
-    @app_commands.describe(
-        id="ID Discord de l'utilisateur",
-        raison="Raison (optionnel)",
-        lien="Lien de preuve Discord (optionnel)"
-    )
-    async def bl_add(self, interaction: Interaction, id: str, raison: str = "", lien: str = None):
-        if interaction.user.id not in ALLOWED_IDS:
-            return await interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
-        if lien and not DISCORD_LINK_RE.match(lien):
-            return await interaction.response.send_message("❌ Lien invalide. Format attendu : `https://discord.com/channels/GUILD/CHANNEL/MESSAGE`", ephemeral=True)
-        try:
-            tid = int(id.strip())
-        except ValueError:
-            return await interaction.response.send_message("❌ ID invalide.", ephemeral=True)
-
-        try:
-            target = await self.bot.fetch_user(tid)
-            target_str = f"{target} (`{tid}`)"
-            avatar = target.display_avatar.url
-        except Exception:
-            target_str = f"`{tid}`"
-            avatar = None
-
-        gname = interaction.guild.name if interaction.guild else "DM"
-
-        embed = discord.Embed(
-            title="⚠️ Confirmation — Blacklist",
-            description="Tu es sur le point d'ajouter cet utilisateur à la blacklist globale.",
-            color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Utilisateur", value=target_str, inline=True)
-        embed.add_field(name="Raison", value=raison or "—", inline=False)
-        if lien:
-            embed.add_field(name="Preuve", value=f"[Voir]({lien})", inline=False)
-        if avatar:
-            embed.set_thumbnail(url=avatar)
-
-        class ConfirmView(discord.ui.View):
-            def __init__(self_v):
-                super().__init__(timeout=60)
-
-            @discord.ui.button(label="✅ Confirmer", style=discord.ButtonStyle.danger)
-            async def confirm(self_v, btn: discord.Interaction, button: discord.ui.Button):
-                if btn.user.id != interaction.user.id:
-                    return await btn.response.send_message("❌ Pas pour toi.", ephemeral=True)
-                self_v.stop()
-                gid = str(interaction.guild.id) if interaction.guild else ""
-                conn = get_db()
-                conn.execute(
-                    """INSERT OR IGNORE INTO global_blacklist
-                       (type, value, reason, added_at, source_guild_id, source_guild_name)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    ("user", str(tid), raison, datetime.now(timezone.utc).isoformat(), gid, gname)
-                )
-                conn.commit()
-                changed = conn.execute("SELECT changes()").fetchone()[0]
-                conn.close()
-
-                if changed:
-                    gid_int = interaction.guild.id if interaction.guild else 0
-                    write_event("global_ban", tid, raison, str(btn.user),
-                                btn.user.id, lien or "", gid_int, gname)
-                    _write_audit("blacklist_add", tid, target_str, btn.user.id,
-                                 str(btn.user), raison, lien or "", gname)
-
-                    # DM à l'utilisateur blacklisté
-                    dm = discord.Embed(
-                        title="⛔ Tu as été signalé sur le réseau SaveZone",
-                        color=discord.Color.dark_red(),
-                        timestamp=datetime.now(timezone.utc)
-                    )
-                    dm.add_field(name="Raison", value=raison or "—", inline=False)
-                    dm.add_field(name="Serveur d'origine", value=gname, inline=True)
-                    if lien:
-                        dm.add_field(name="Preuve", value=f"[Voir le message]({lien})", inline=False)
-                    dm.set_footer(text="Si tu penses qu'il s'agit d'une erreur, contacte les administrateurs du réseau.")
-                    asyncio.create_task(_send_dm(self.bot, tid, dm))
-
-                    done = discord.Embed(title="🚫 Utilisateur blacklisté", color=0xED4245,
-                                         timestamp=datetime.now(timezone.utc))
-                    done.add_field(name="Utilisateur", value=target_str, inline=True)
-                    done.add_field(name="Raison", value=raison or "—", inline=False)
-                    if lien:
-                        done.add_field(name="Preuve", value=f"[Voir]({lien})", inline=False)
-                    done.add_field(name="Raven notifié", value="✅ via DB (15s)", inline=False)
-                    done.set_footer(text=f"par {btn.user}")
-                    if avatar:
-                        done.set_thumbnail(url=avatar)
-                    await btn.response.edit_message(embed=done, view=None)
-                    asyncio.create_task(send_alerts(self.bot, tid, raison, str(btn.user),
-                                                    lien, gname, BOT_NAME))
-                else:
-                    await btn.response.edit_message(
-                        embed=discord.Embed(title=f"ℹ️ `{tid}` est déjà dans la blacklist.", color=discord.Color.greyple()),
-                        view=None
-                    )
-
-            @discord.ui.button(label="❌ Annuler", style=discord.ButtonStyle.secondary)
-            async def cancel(self_v, btn: discord.Interaction, button: discord.ui.Button):
-                if btn.user.id != interaction.user.id:
-                    return await btn.response.send_message("❌ Pas pour toi.", ephemeral=True)
-                self_v.stop()
-                await btn.response.edit_message(
-                    embed=discord.Embed(title="❌ Annulé", color=discord.Color.greyple()),
-                    view=None
-                )
-
-        await interaction.response.send_message(embed=embed, view=ConfirmView(), ephemeral=True)
-
-    @bl_group.command(name="remove", description="Retirer de la blacklist")
-    @app_commands.describe(type="Type", valeur="Valeur à retirer")
-    async def bl_remove(self, interaction: Interaction, type: str, valeur: str):
-        if interaction.user.id not in ALLOWED_IDS:
-            return await interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
-        if type not in self._TYPES:
-            return await interaction.response.send_message(f"❌ Types valides : {', '.join(self._TYPES)}", ephemeral=True)
-        conn = get_db()
-        conn.execute("DELETE FROM global_blacklist WHERE type=? AND value=?", (type, valeur.strip().lower()))
-        conn.commit()
-        changed = conn.execute("SELECT changes()").fetchone()[0]
-        conn.close()
-        await interaction.response.send_message(
-            f"🗑️ `{valeur}` retiré." if changed else f"❌ `{valeur}` non trouvé.", ephemeral=True
-        )
-
-    @bl_group.command(name="liste", description="Voir la blacklist globale")
-    @app_commands.describe(type="Filtrer par type (laisser vide = tout)")
-    async def bl_liste(self, interaction: Interaction, type: str = "all"):
-        if interaction.user.id not in ALLOWED_IDS:
-            return await interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
-        conn = get_db()
-        if type and type != "all":
-            rows = conn.execute("SELECT * FROM global_blacklist WHERE type=? ORDER BY added_at DESC", (type,)).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM global_blacklist ORDER BY type, added_at DESC").fetchall()
-        conn.close()
-        rows = [dict(r) for r in rows]
-
-        embed = discord.Embed(title="🚫 Blacklist globale", color=0xED4245, timestamp=datetime.now(timezone.utc))
-        if not rows:
-            embed.description = "*Vide.*"
-        else:
-            by_type: dict = {}
-            for r in rows:
-                by_type.setdefault(r["type"], []).append(r)
-            for t, entries in by_type.items():
-                em, lbl = _TYPE_LABELS.get(t, ("🔹", t))
-                lines = []
-                for e in entries[:10]:
-                    orig = f" *(via {e['source_guild_name']})*" if e.get("source_guild_name") else ""
-                    lines.append(f"• `{e['value']}`{orig}")
-                if len(entries) > 10:
-                    lines.append(f"*+{len(entries) - 10} autres*")
-                embed.add_field(name=f"{em} {lbl} ({len(entries)})", value="\n".join(lines), inline=False)
-            embed.set_footer(text=f"{len(rows)} entrée(s)")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
     @global_group.command(name="logs", description="Voir les dernières actions d'administration globale")
     async def global_logs(self, interaction: Interaction):
-        is_admin = interaction.user.id in ALLOWED_IDS
-        if not is_admin and interaction.guild:
-            m = interaction.guild.get_member(interaction.user.id)
-            if m and m.guild_permissions.administrator:
-                is_admin = True
-        if not is_admin:
-            return await interaction.response.send_message("❌ Réservé aux administrateurs.", ephemeral=True)
+        if not await _require(interaction, ALLOWED_IDS):
+            return
 
         conn = get_db()
         rows = conn.execute(
@@ -895,9 +983,8 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
         conn.close()
 
         _ACTIONS = {
-            "global_ban":    ("🔨", "Ban global"),
-            "global_unban":  ("✅", "Unban global"),
-            "blacklist_add": ("🚫", "Blacklist ajout"),
+            "global_ban":   ("🔨", "Ban global"),
+            "global_unban": ("✅", "Unban global"),
         }
 
         embed = discord.Embed(title="📋 Logs d'administration globale", color=0x5865F2,
@@ -918,20 +1005,58 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
         embed.set_footer(text="15 dernières actions")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # --- /global watch / unwatch ---
+
+    @global_group.command(name="watch", description="⚠️ Surveille un salon (forum de report) pour proposer des Global Ban automatiquement")
+    @app_commands.describe(salon="Le salon forum à surveiller (doit être dans ce serveur)")
+    async def global_watch(self, interaction: Interaction, salon: discord.ForumChannel):
+        if not await _require(interaction, ADMIN_IDS):
+            return
+        if not interaction.guild or interaction.guild.id != REVIEW_GUILD_ID:
+            return await interaction.response.send_message(
+                "❌ Cette commande n'est utilisable que sur le serveur de review.", ephemeral=True
+            )
+
+        added = add_watch_channel(salon.id, salon.guild.id, str(interaction.user))
+        if added:
+            await interaction.response.send_message(
+                f"✅ Le salon {salon.mention} est maintenant **surveillé**. "
+                f"Les nouveaux posts contenant un ID en fin de titre (`nom - id`) déclencheront une proposition de Global Ban "
+                f"dans le salon de review.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(f"ℹ️ Le salon {salon.mention} est déjà surveillé.", ephemeral=True)
+
+    @global_group.command(name="unwatch", description="⚠️ Retire un salon de la surveillance Global Ban automatique")
+    @app_commands.describe(salon="Le salon forum à ne plus surveiller")
+    async def global_unwatch(self, interaction: Interaction, salon: discord.ForumChannel):
+        if not await _require(interaction, ADMIN_IDS):
+            return
+        if not interaction.guild or interaction.guild.id != REVIEW_GUILD_ID:
+            return await interaction.response.send_message(
+                "❌ Cette commande n'est utilisable que sur le serveur de review.", ephemeral=True
+            )
+
+        removed = remove_watch_channel(salon.id)
+        if removed:
+            await interaction.response.send_message(f"✅ Le salon {salon.mention} n'est plus surveillé.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"ℹ️ Le salon {salon.mention} n'était pas surveillé.", ephemeral=True)
+
     # --- /globaladmin ---
 
     gadmin = app_commands.Group(
         name="globaladmin",
         description="Gérer qui peut utiliser /global ban etc.",
-        default_permissions=discord.Permissions(administrator=True)
     )
 
     @gadmin.command(name="add", description="Donner accès aux commandes /global à quelqu'un")
     @app_commands.describe(utilisateur="L'user à autoriser")
     async def gadmin_add(self, interaction: Interaction, utilisateur: discord.User):
-        if interaction.user.id not in SUPER_ADMIN_IDS:
-            return await interaction.response.send_message("❌ Réservé aux super admins.", ephemeral=True)
-        if utilisateur.id in SUPER_ADMIN_IDS:
+        if not await _require(interaction, ADMIN_IDS):
+            return
+        if utilisateur.id in ADMIN_IDS:
             return await interaction.response.send_message("ℹ️ Cette personne a toujours accès.", ephemeral=True)
         if add_allowed(utilisateur.id, str(interaction.user)):
             await interaction.response.send_message(f"✅ **{utilisateur}** peut maintenant faire `/global ban` etc.", ephemeral=True)
@@ -941,10 +1066,10 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
     @gadmin.command(name="remove", description="Retirer l'accès aux commandes /global")
     @app_commands.describe(utilisateur="L'user à révoquer")
     async def gadmin_remove(self, interaction: Interaction, utilisateur: discord.User):
-        if interaction.user.id not in SUPER_ADMIN_IDS:
-            return await interaction.response.send_message("❌ Réservé aux super admins.", ephemeral=True)
-        if utilisateur.id in SUPER_ADMIN_IDS:
-            return await interaction.response.send_message("❌ Impossible de retirer l'accès à un super admin.", ephemeral=True)
+        if not await _require(interaction, ADMIN_IDS):
+            return
+        if utilisateur.id in ADMIN_IDS:
+            return await interaction.response.send_message("❌ Impossible de retirer l'accès à un admin.", ephemeral=True)
         if remove_allowed(utilisateur.id):
             await interaction.response.send_message(f"✅ `{utilisateur.id}` n'a plus accès.", ephemeral=True)
         else:
@@ -952,11 +1077,11 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
 
     @gadmin.command(name="list", description="Voir les admins global ban")
     async def gadmin_list(self, interaction: Interaction):
-        if interaction.user.id not in ALLOWED_IDS:
-            return await interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
+        if not await _require(interaction, ALLOWED_IDS):
+            return
         embed = discord.Embed(title="🌍 Admins Global Ban", color=discord.Color.dark_purple(),
                               timestamp=datetime.now(timezone.utc))
-        lines = [f"👑 <@{OWNER_ID}> (`{OWNER_ID}`) — *proprio (permanent)*"]
+        lines = [f"👑 <@{uid}> (`{uid}`) — *admin (permanent)*" for uid in ADMIN_IDS]
         for row in list_allowed():
             uid = row["user_id"]
             date = (row["added_at"] or "?")[:10]
@@ -969,57 +1094,6 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
         embed.description = "\n".join(lines)
         embed.set_footer(text=f"{len(ALLOWED_IDS)} ID(s) en mémoire")
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # commandes prefix globaladmin (owner only)
-
-    @commands.group(name="globaladmin", aliases=["gadmin"], invoke_without_command=True)
-    async def gadmin_prefix(self, ctx: commands.Context):
-        if ctx.author.id not in SUPER_ADMIN_IDS:
-            return
-        p = ctx.prefix
-        await ctx.send(f"`{p}globaladmin add <id>` | `remove <id>` | `list`")
-
-    @gadmin_prefix.command(name="add")
-    async def gadmin_prefix_add(self, ctx, user_id: str):
-        if ctx.author.id not in SUPER_ADMIN_IDS:
-            return
-        try:
-            uid = int(user_id)
-        except ValueError:
-            return await ctx.send("❌ ID invalide.")
-        if uid in SUPER_ADMIN_IDS:
-            return await ctx.send("ℹ️ Cette personne a toujours accès.")
-        if add_allowed(uid, str(ctx.author)):
-            try:
-                u = await self.bot.fetch_user(uid)
-                await ctx.send(f"✅ **{u}** peut utiliser `/global`.")
-            except Exception:
-                await ctx.send(f"✅ `{uid}` ajouté.")
-        else:
-            await ctx.send(f"ℹ️ `{uid}` avait déjà accès.")
-
-    @gadmin_prefix.command(name="remove")
-    async def gadmin_prefix_remove(self, ctx, user_id: str):
-        if ctx.author.id not in SUPER_ADMIN_IDS:
-            return
-        try:
-            uid = int(user_id)
-        except ValueError:
-            return await ctx.send("❌ ID invalide.")
-        if uid in SUPER_ADMIN_IDS:
-            return await ctx.send("❌ Impossible.")
-        await ctx.send(f"✅ `{uid}` retiré." if remove_allowed(uid) else f"ℹ️ `{uid}` pas dans la liste.")
-
-    @gadmin_prefix.command(name="list")
-    async def gadmin_prefix_list(self, ctx):
-        if ctx.author.id not in SUPER_ADMIN_IDS:
-            return
-        embed = discord.Embed(title="🌍 Admins Global Ban", color=discord.Color.dark_purple())
-        lines = [f"👑 <@{OWNER_ID}> — *proprio*"]
-        for row in list_allowed():
-            lines.append(f"• <@{row['user_id']}> — {(row['added_at'] or '?')[:10]}")
-        embed.description = "\n".join(lines)
-        await ctx.send(embed=embed)
 
     # --- /globalsync (opt-in par serveur) ---
 
@@ -1076,10 +1150,9 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
 
 
     @app_commands.command(name="list", description="Voir la liste des utilisateurs blacklistés globalement")
-    @app_commands.default_permissions(administrator=True)
     async def list_users(self, interaction: Interaction):
-        if interaction.user.id not in ALLOWED_IDS:
-            return await interaction.response.send_message("❌ Accès refusé.", ephemeral=True)
+        if not await _require(interaction, ALLOWED_IDS):
+            return
         conn = get_db()
         rows = conn.execute(
             "SELECT value, reason, added_at, source_guild_name FROM global_blacklist WHERE type='user' ORDER BY added_at DESC"
@@ -1105,41 +1178,13 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
             embed.description = "\n".join(lines)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @commands.command(name="list")
-    async def list_prefix(self, ctx: commands.Context):
-        if ctx.author.id not in SUPER_ADMIN_IDS:
-            return
-        p = ctx.prefix
-        embed = discord.Embed(
-            title="📋 Commandes préfixe",
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="🔧 Admin", value=(
-            f"`{p}sync [guild_id]` — sync les slash commands\n"
-            f"`{p}reload [cog|all]` — recharge un cog\n"
-            f"`{p}cogs` — liste les cogs chargés\n"
-            f"`{p}bots` — infos du bot\n"
-            f"`{p}reboot` — redémarre le bot"
-        ), inline=False)
-        embed.add_field(name="🌍 Global Admin", value=(
-            f"`{p}globaladmin add <id>` — donner accès à /global\n"
-            f"`{p}globaladmin remove <id>` — retirer l'accès\n"
-            f"`{p}globaladmin list` — voir les admins global ban"
-        ), inline=False)
-        embed.add_field(name="📋 Listes", value=(
-            f"`{p}list` — cette aide\n"
-        ), inline=False)
-        embed.set_footer(text=f"Owner only • {len(ctx.bot.commands)} commandes enregistrées")
-        await ctx.send(embed=embed)
-
     # --- /aidesafezone (staff) ---
 
     @app_commands.command(name="aidesafezone", description="📖 Mode d'emploi de configuration du réseau Global Ban (staff)")
     @app_commands.default_permissions(administrator=True)
     async def aide_safezone(self, interaction: Interaction):
         embed = discord.Embed(
-            title="📖 Configurer le réseau SaveZone / Global Ban",
+            title="📖 Configurer le réseau SafeZone / Global Ban",
             color=discord.Color.dark_purple(),
             timestamp=datetime.now(timezone.utc)
         )
@@ -1149,22 +1194,48 @@ class GlobalModCog(commands.Cog, name="GlobalMod"):
             "`/globalsync status` — voir l'état actuel"
         ), inline=False)
         embed.add_field(name="2️⃣ Agir sur la blacklist globale", value=(
-            "`/global ban <id>` — bannir partout + alerter les serveurs opt-in\n"
+            "`/global ban <id> <raison> <lien>` — bannir partout + alerter les serveurs opt-in "
+            "(raison et lien de preuve obligatoires)\n"
             "`/global unban <id>` — retirer de la blacklist + débannir\n"
             "`/global check <id>` — voir si quelqu'un est blacklisté\n"
-            "`/global logs` — historique des dernières actions"
+            "`/global logs` — historique des dernières actions\n"
+            "`/list` — voir tous les utilisateurs blacklistés"
         ), inline=False)
-        embed.add_field(name="3️⃣ Gérer qui a accès à ces commandes", value=(
-            "`/globaladmin add <user>` — donner l'accès à /global\n"
+        embed.add_field(name="3️⃣ Détection automatique des reports", value=(
+            "`/global watch #forum` — surveille un forum de report ; chaque nouveau post avec un ID en fin de titre "
+            "génère automatiquement une proposition (avec preuve) dans le salon de review\n"
+            "`/global unwatch #forum` — arrête la surveillance\n"
+            "-# Utilisable uniquement sur ce serveur de review, et seulement par les admins fixés dans le code "
+            "(indépendant de /globaladmin). La proposition est postée automatiquement, mais reste soumise "
+            "à validation humaine (✅ Confirmer / 🗑️ Ignorer) avant le ban réel."
+        ), inline=False)
+        embed.add_field(name="4️⃣ Gérer qui a accès à ces commandes", value=(
+            "`/globaladmin add <user>` — donner l'accès à /global ban/unban/check/logs et /list\n"
             "`/globaladmin remove <user>` — retirer l'accès\n"
-            "`/globaladmin list` — voir qui a accès"
-        ), inline=False)
-        embed.add_field(name="4️⃣ Logs classiques du serveur (optionnel)", value=(
-            "`/logsetup set <type> #salon` — configurer un salon de log\n"
-            "`/logsetup remove <type>` — désactiver un type de log\n"
-            "`/logsetup view` — voir la config actuelle"
+            "`/globaladmin list` — voir qui a accès\n"
+            "-# /global watch et /unwatch ne sont pas concernés par /globaladmin — accès fixé dans le code, "
+            "et seul un des admins fixés peut en ajouter/retirer d'autres."
         ), inline=False)
         embed.set_footer(text="Réservé aux admins du serveur")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # --- /aideadmin (admin d'un serveur qui reçoit juste les alertes) ---
+
+    @app_commands.command(name="aideadmin", description="📖 Comment recevoir les alertes de Global Ban sur ton serveur")
+    @app_commands.default_permissions(administrator=True)
+    async def aide_admin(self, interaction: Interaction):
+        embed = discord.Embed(
+            title="📖 Configurer ton serveur pour recevoir les alertes",
+            description="Ce bot fait partie d'un réseau inter-serveurs : quand un utilisateur est banni globalement ailleurs, ton serveur peut être alerté et bannir en un clic.",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="1️⃣ Activer les alertes", value=(
+            "`/globalsync on #salon` — les alertes (avec boutons ✅ Bannir / ❌ Ignorer) arrivent dans ce salon\n"
+            "`/globalsync off` — désactive\n"
+            "`/globalsync status` — voir l'état actuel"
+        ), inline=False)
+        embed.set_footer(text="/global ban, check et la gestion des accès sont réservés aux comptes autorisés via /globaladmin")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # --- /aide (membre) ---

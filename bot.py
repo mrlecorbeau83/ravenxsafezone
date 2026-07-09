@@ -6,7 +6,7 @@ import os
 load_dotenv()
 
 
-class SaveZoneBot(commands.Bot):
+class SafeZoneBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -22,17 +22,17 @@ class SaveZoneBot(commands.Bot):
         self._synced = False
 
     async def on_ready(self):
-        print(f"[SaveZone] Connecté : {self.user} ({self.user.id})")
-        print(f"[SaveZone] {len(self.guilds)} serveur(s) | préfixe : {self.command_prefix}")
+        print(f"[SafeZone] Connecté : {self.user} ({self.user.id})")
+        print(f"[SafeZone] {len(self.guilds)} serveur(s) | préfixe : {self.command_prefix}")
         if not self._synced:
             synced = await self.tree.sync()
             self._synced = True
-            print(f"[SaveZone] {len(synced)} slash command(s) synchronisée(s)")
+            print(f"[SafeZone] {len(synced)} slash command(s) synchronisée(s)")
 
     async def on_guild_join(self, guild: discord.Guild):
-        print(f"[SaveZone] Nouveau serveur rejoint : {guild.name} ({guild.id})")
+        print(f"[SafeZone] Nouveau serveur rejoint : {guild.name} ({guild.id})")
 
     async def on_command_error(self, ctx, error):
         if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
             return
-        print(f"[SaveZone CMD ERROR] {ctx.command}: {error}")
+        print(f"[SafeZone CMD ERROR] {ctx.command}: {error}")
